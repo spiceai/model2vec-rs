@@ -1,10 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use half::f16;
-use hf_hub::api::sync::Api;
+use hf_hub::api::sync::{Api, ApiBuilder};
 use ndarray::Array2;
 use safetensors::{tensor::Dtype, SafeTensors};
 use serde_json::Value;
-use std::{env, fs, path::Path};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 use tokenizers::Tokenizer;
 
 /// Static embedding model for Model2Vec
@@ -48,7 +51,11 @@ impl StaticModel {
                 }
                 (t, m, c)
             } else {
-                let api = Api::new().context("hf-hub API init failed")?;
+                let mut api_builder = ApiBuilder::from_env();
+                if let Some(cache_dir) = env::var_os("HF_HUB_CACHE") {
+                    api_builder = api_builder.with_cache_dir(PathBuf::from(cache_dir));
+                };
+                let api = api_builder.build().context("hf-hub API init failed")?;
                 let repo = api.model(repo_or_path.as_ref().to_string_lossy().into_owned());
                 let prefix = subfolder.map(|s| format!("{}/", s)).unwrap_or_default();
                 let t = repo.get(&format!("{prefix}tokenizer.json"))?;
