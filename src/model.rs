@@ -38,17 +38,18 @@ impl StaticModel {
             env::set_var("HF_HUB_TOKEN", tok);
         }
 
-        // Locate tokenizer.json, model.safetensors, config.json
+        // Locate tokenizer.json, model.safetensors, and optionally config.json
         let (tok_path, mdl_path, cfg_path) = {
             let base = repo_or_path.as_ref();
             if base.exists() {
                 let folder = subfolder.map(|s| base.join(s)).unwrap_or_else(|| base.to_path_buf());
                 let t = folder.join("tokenizer.json");
                 let m = folder.join("model.safetensors");
-                let c = folder.join("config.json");
-                if !t.exists() || !m.exists() || !c.exists() {
-                    return Err(anyhow!("local path {folder:?} missing tokenizer / model / config"));
+                if !t.exists() || !m.exists() {
+                    return Err(anyhow!("local path {folder:?} missing tokenizer.json or model.safetensors"));
                 }
+                let c = folder.join("config.json");
+                let c = if c.exists() { Some(c) } else { None };
                 (t, m, c)
             } else {
                 let mut api_builder = ApiBuilder::from_env();
@@ -60,7 +61,7 @@ impl StaticModel {
                 let prefix = subfolder.map(|s| format!("{}/", s)).unwrap_or_default();
                 let t = repo.get(&format!("{prefix}tokenizer.json"))?;
                 let m = repo.get(&format!("{prefix}model.safetensors"))?;
-                let c = repo.get(&format!("{prefix}config.json"))?;
+                let c = repo.get(&format!("{prefix}config.json")).ok();
                 (t, m, c)
             }
         };
@@ -73,10 +74,15 @@ impl StaticModel {
         lens.sort_unstable();
         let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
 
-        // Read normalize default from config.json
-        let cfg_file = std::fs::File::open(&cfg_path).context("failed to read config.json")?;
-        let cfg: Value = serde_json::from_reader(&cfg_file).context("failed to parse config.json")?;
-        let cfg_norm = cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true);
+        // Read normalize default from config.json if available, otherwise default to true
+        let cfg_norm = if let Some(cfg_path) = &cfg_path {
+            let cfg_file = std::fs::File::open(cfg_path).context("failed to read config.json")?;
+            let cfg: Value = serde_json::from_reader(&cfg_file).context("failed to parse config.json")?;
+            cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true)
+        } else {
+            log::warn!("config.json not found, defaulting normalize=true");
+            true
+        };
         let normalize = normalize.unwrap_or(cfg_norm);
 
         // Serialize the tokenizer to JSON, then parse it and get the unk_token
@@ -99,6 +105,7 @@ impl StaticModel {
         let safet = SafeTensors::deserialize(&model_bytes).context("failed to parse safetensors")?;
         let tensor = safet
             .tensor("embeddings")
+            .or_else(|_| safet.tensor("embedding.weight"))
             .or_else(|_| safet.tensor("0"))
             .context("embeddings tensor not found")?;
 
