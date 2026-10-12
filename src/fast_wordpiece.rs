@@ -18,7 +18,9 @@
 //!
 //! Literal added-token text (e.g. `[MASK]`, `[CLS]`) is matched and resolved
 //! to its id before normalization, matching the crate's `AddedVocabulary`
-//! step — see [`FastWordPiece::split_added_tokens`].
+//! step — see [`FastWordPiece::split_added_tokens`]. Added tokens that set
+//! `normalized`, `single_word`, `lstrip` or `rstrip` are not supported and
+//! make [`FastWordPiece::from_tokenizer`] return `None`.
 
 use std::collections::HashMap;
 
@@ -48,12 +50,12 @@ pub(crate) struct FastWordPiece {
     /// run, regardless of `add_special_tokens` (that flag only gates the
     /// post-processor's CLS/SEP insertion, not this literal-match step) — so a
     /// literal `[MASK]` mid-sentence must resolve to its added-token id here
-    /// too, not fall through to WordPiece on the lowercased text. Only
-    /// `normalized: false` entries are handled; a tokenizer with a
-    /// `normalized: true` added token is rejected in [`FastWordPiece::from_json`]
-    /// (returning `None` and falling back to the crate) since matching it would
-    /// need the normalized text instead — unimplemented, unneeded for the
-    /// potion models.
+    /// too, not fall through to WordPiece on the lowercased text. Only plain
+    /// `normalized: false` entries are handled; a tokenizer with an added
+    /// token that sets `normalized`, `single_word`, `lstrip` or `rstrip` is
+    /// rejected in [`FastWordPiece::from_json`] (returning `None` and falling
+    /// back to the crate) since those change the matching rules —
+    /// unimplemented, unneeded for the potion models.
     added_tokens: Vec<(String, u32)>,
     /// First byte of every entry in `added_tokens`, so `split_added_tokens`
     /// can skip the `starts_with` scan at byte positions that can't possibly
@@ -160,6 +162,14 @@ impl FastWordPiece {
                 bail!(
                     "added token {content:?} has normalized: true, which FastWordPiece doesn't implement (only normalized: false literal matching is supported)"
                 );
+            }
+            // These flags change where the crate accepts a match (word
+            // boundaries, surrounding whitespace); only plain literal
+            // matching is implemented here.
+            for flag in ["single_word", "lstrip", "rstrip"] {
+                if t.get(flag).and_then(|v| v.as_bool()).unwrap_or(false) {
+                    bail!("added token {content:?} has {flag}: true, which FastWordPiece doesn't implement");
+                }
             }
             added_tokens.push((content.to_string(), id));
         }
@@ -487,7 +497,7 @@ fn is_chinese_char(c: char) -> bool {
 mod tests {
     use super::*;
     use std::path::Path;
-    use tokenizers::Tokenizer;
+    use tokenizers::{AddedToken, Tokenizer};
 
     fn corpus() -> Vec<&'static str> {
         vec![
@@ -558,6 +568,8 @@ mod tests {
             "[MASK] [CLS] [SEP] [PAD] [UNK]",
             "foo[SEP]bar text[MASK]here",
             "[unk] lowercase specials", // normalized-form collision check
+            "x[SEP]y",                  // added token glued to words on both sides
+            "fill the [MASK] here",
         ]
     }
 
@@ -594,5 +606,53 @@ mod tests {
             FastWordPiece::from_json(&spec).is_err(),
             "non-WordPiece pipeline must fall back to the crate tokenizer"
         );
+    }
+
+    fn fixture_tokenizer() -> Tokenizer {
+        Tokenizer::from_file(Path::new("tests/fixtures/test-model-float32/tokenizer.json"))
+            .expect("load fixture tokenizer")
+    }
+
+    /// An added token matched against normalized text is not implemented, so
+    /// the fast path must decline it.
+    #[test]
+    fn normalized_added_token_falls_back() {
+        let mut tok = fixture_tokenizer();
+        // `special: false` gives `normalized: true`.
+        tok.add_tokens(&[AddedToken::from("hello world", false)]);
+        assert!(FastWordPiece::from_tokenizer(&tok).is_none());
+    }
+
+    /// `single_word`, `lstrip` and `rstrip` change how the crate matches an
+    /// added token (e.g. `single_word` does not match `a[TOK]b`), so the fast
+    /// path must decline them.
+    #[test]
+    fn added_token_match_flags_fall_back() {
+        let flagged = [
+            ("single_word", AddedToken::from("[TOK]", true).single_word(true)),
+            ("lstrip", AddedToken::from("[TOK]", true).lstrip(true)),
+            ("rstrip", AddedToken::from("[TOK]", true).rstrip(true)),
+        ];
+        for (flag, token) in flagged {
+            let mut tok = fixture_tokenizer();
+            tok.add_special_tokens(&[token]);
+            assert!(
+                FastWordPiece::from_tokenizer(&tok).is_none(),
+                "added token with {flag} must fall back to the crate tokenizer"
+            );
+        }
+    }
+
+    /// A plain `normalized: false` added token is supported and must match
+    /// the crate wherever it appears.
+    #[test]
+    fn plain_added_token_matches_crate() {
+        let mut tok = fixture_tokenizer();
+        tok.add_special_tokens(&[AddedToken::from("[TOK]", true)]);
+        let ft = FastWordPiece::from_tokenizer(&tok).expect("plain added token is supported");
+        for text in ["a [TOK] b", "a[TOK]b", "[TOK]y z", "é[TOK]你", "[TOK][TOK] [TOK]"] {
+            let want: Vec<u32> = tok.encode_fast(text, false).expect("crate encode").get_ids().to_vec();
+            assert_eq!(ft.encode_ids(text), want, "token-id mismatch for {text:?}");
+        }
     }
 }
